@@ -1,0 +1,52 @@
+#!/bin/bash 
+#1.创建虚拟环境并激活
+git clone https://github.com/azeElaine/DiffQRCoder2.git
+sudo add-apt-repository universe 
+sudo apt update             
+sudo apt install python3-venv -y
+python3.10 -m venv project-env
+source project-env/bin/activate
+cd DiffQRCoder2
+#2.pip相关包
+pip install --upgrade pip
+pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu118
+pip install \
+  accelerate==1.3.0 \
+  diffusers==0.32.2 \
+  numpy==1.26.0 \
+  opencv-python==4.11.0.86 \
+  tqdm==4.67.1 \
+  "triton==3.2.0; sys_platform == 'linux'" \
+  transformers==4.48.3
+pip install xformers
+# 3. 验证安装
+echo "验证结果："
+python -c "import torch; print(f'PyTorch版本: {torch.__version__} (预期2.6.0)\nCUDA可用: {torch.cuda.is_available()} (预期True)\nCUDA版本: {torch.version.cuda} (预期11.8)')"
+#4.下载权重文件
+python -m pip install huggingface_hub -U
+huggingface-cli --help#验证
+export HF_ENDPOINT="https://hf-mirror.com"
+huggingface-cli download monster-labs/control_v1p_sd15_qrcode_monster \
+  --include "config.json" "diffusion_pytorch_model.safetensors" \
+  --local-dir control_v1p_sd15_qrcode_monster
+huggingface-cli download fp16-guy/Cetus-Mix_Whalefall_fp16_cleaned \
+  --include "cetusMix_Whalefall2_fp16.safetensors" "model_index.json" \
+  --local-dir cetus-mix
+5.修改参数为本地路径
+parser.add_argument(
+    "--controlnet_ckpt",
+    type=str,
+    default="./control_v1p_sd15_qrcode_monster"  # 指向本地ControlNet目录
+)
+parser.add_argument(
+    "--pipe_ckpt",
+    type=str,
+    default="./cetus-mix/cetusMix_Whalefall2_fp16.safetensors"  # 指向本地模型文件
+)
+6.相关指令
+zip -r DiffQRCoder2.zip DiffQRCoder2   zip -r project-env.zip project-env
+rm -rf DiffQRCoder2  rm -rf project-env
+zip -r control_v1p_sd15_qrcode_monster.zip control_v1p_sd15_qrcode_monster
+zip -r cetus-mix.zip cetus-mix
+rm -rf checkpoints
+7.python run.py --logo_path path/to/your/logo.png --extract_logo --logo_position center --logo_size_ratio 0.3 --edge_smoothness_weight 0.15 --bg_threshold 230
