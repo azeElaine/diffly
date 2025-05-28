@@ -33,6 +33,9 @@ class LogoLoss(nn.Module):
         logo_image: torch.Tensor,
         logo_mask: torch.Tensor
     ) -> torch.Tensor:
+        # 打印数据类型信息，用于调试
+        print(f"Logo Loss - Input types: generated_image={generated_image.dtype}, logo_image={logo_image.dtype}, logo_mask={logo_mask.dtype}")
+        
         # 提取logo区域特征
         logo_region = generated_image * logo_mask
         target_region = logo_image * logo_mask
@@ -51,7 +54,10 @@ class LogoLoss(nn.Module):
         
         # 计算边缘平滑损失 - 确保与周围二维码区域的自然过渡
         # 创建略微扩大的mask以获取边缘区域
-        edge_kernel = torch.ones(1, 1, 3, 3).to(logo_mask.device)
+        # 显式检查并匹配数据类型
+        dtype = logo_mask.dtype
+        edge_kernel = torch.ones(1, 1, 3, 3, dtype=dtype, device=logo_mask.device)
+        print(f"Logo Loss - Filter types: edge_kernel={edge_kernel.dtype}, logo_mask={logo_mask.dtype}")
         dilated_mask = F.conv2d(logo_mask, edge_kernel, padding=1)
         dilated_mask = torch.clamp(dilated_mask, 0, 1)
         edge_mask = dilated_mask - logo_mask
@@ -60,8 +66,11 @@ class LogoLoss(nn.Module):
         edge_region_generated = generated_image * edge_mask
         
         # 使用索贝尔滤波器检测边缘上的梯度
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3).to(generated_image.device)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3).to(generated_image.device)
+        # 确保与输入图像相同的数据类型
+        dtype = generated_image.dtype
+        device = generated_image.device
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=dtype, device=device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=dtype, device=device).view(1, 1, 3, 3)
         
         # 对每个通道单独应用
         edge_smoothness_loss = 0

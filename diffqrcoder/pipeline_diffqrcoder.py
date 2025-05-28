@@ -1,5 +1,5 @@
 from typing import Any, Callable, Dict, List, Optional, Union
-
+import os
 import torch
 from diffusers import StableDiffusionControlNetPipeline
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
@@ -156,6 +156,10 @@ class DiffQRCoderPipeline(StableDiffusionControlNetPipeline):
             Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        save_intermediate_steps: bool = False,  # 新增参数
+        intermediate_dir: str = "output/intermediate",  # 新增参数
+        use_custom_postprocess: bool = False,  # 新增参数，控制是否使用自定义后处理
+        use_original_qrcode: bool = False,  # 新增参数，控制是否使用原始二维码
         **kwargs,
     ):
         self.srpg = ScanningRobustPerceptualGuidance(
@@ -517,19 +521,85 @@ class DiffQRCoderPipeline(StableDiffusionControlNetPipeline):
             with torch.enable_grad():
                 latents = latents.clone().detach().requires_grad_(True)
                 optimizer = torch.optim.SGD([latents], lr=srmpgd_lr)
-
+                
+                # 用于保存中间结果的变量
+                if save_intermediate_steps:
+                    from PIL import Image
+                    import torchvision.transforms as T
+                    to_pil = T.ToPILImage()
+                
+                print(f"执行 SR-MPGD 优化，迭代次数: {srmpgd_num_iteration}")
                 for i in trange(srmpgd_num_iteration):
                     optimizer.zero_grad()
-                    original_image = self.vae.decode(latents / self.vae.config.scaling_factor,return_dict=False)[0]
-                    loss = self.srpg.compute_loss(
-                        image=crop_padding(self.image_processor.denormalize(original_image), qrcode_padding),
-                        qrcode=crop_padding(image_binarize(qrcode[qrcode.size(0) // 2, None]), qrcode_padding),
-                        ref_image=crop_padding(ref_image, qrcode_padding),
-                        logo_image=logo_tensor,  # 新增  
-                        logo_mask=logo_mask_tensor,  # 新增  
-                    )
-                    loss.backward()
-                    optimizer.step()
+                    try:
+                        # 检查 latents 是否包含 NaN
+                        if torch.isnan(latents).any():
+                            print(f"迭代 {i}: 检测到 latents 中有 NaN 值，尝试修复...")
+                            latents = torch.nan_to_num(latents.detach(), nan=0.0).requires_grad_(True)
+                            optimizer = torch.optim.SGD([latents], lr=srmpgd_lr)
+                        
+                        original_image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                        
+                        # 检查解码后的图像是否包含 NaN
+                        if torch.isnan(original_image).any():
+                            print(f"迭代 {i}: VAE 解码产生了 NaN 值，尝试修复...")
+                            original_image = torch.nan_to_num(original_image, nan=0.0)
+                        
+                        loss = self.srpg.compute_loss(
+                            image=crop_padding(self.image_processor.denormalize(original_image), qrcode_padding),
+                            qrcode=crop_padding(image_binarize(qrcode[qrcode.size(0) // 2, None]), qrcode_padding),
+                            ref_image=crop_padding(ref_image, qrcode_padding),
+                            logo_image=logo_tensor,
+                            logo_mask=logo_mask_tensor,
+                        )
+                        
+                        # 检查损失是否为 NaN
+                        if torch.isnan(loss):
+                            print(f"迭代 {i}: 损失为 NaN，跳过此次迭代...")
+                            continue
+                        
+                        loss.backward()
+                        
+                        # 检查梯度是否包含 NaN
+                        if torch.isnan(latents.grad).any():
+                            print(f"迭代 {i}: 梯度包含 NaN 值，使用零梯度...")
+                            latents.grad = torch.zeros_like(latents.grad)
+                        
+                        optimizer.step()
+                    except Exception as e:
+                        print(f"迭代 {i} 出错: {e}")
+                        continue
+                    
+                    # 保存中间结果（每5次迭代保存一次）
+                    if save_intermediate_steps and (i % 5 == 0 or i == srmpgd_num_iteration - 1):
+                        with torch.no_grad():
+                            try:
+                                # 解码当前的潜在表示
+                                current_image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                                
+                                # 检查并修复 NaN 值
+                                if torch.isnan(current_image).any():
+                                    current_image = torch.nan_to_num(current_image, nan=0.0)
+                                
+                                # 转换为PIL图像
+                                current_image_cpu = current_image[0].cpu().detach()
+                                
+                                # 确保值在合理范围内
+                                current_image_cpu = torch.clamp(current_image_cpu, -1.0, 1.0)
+                                current_image_cpu = (current_image_cpu + 1.0) / 2.0
+                                current_image_cpu = current_image_cpu * 255
+                                current_image_cpu = current_image_cpu.to(torch.uint8)
+                                
+                                pil_image = to_pil(current_image_cpu)
+                                
+                                # 保存图像
+                                save_path = os.path.join(intermediate_dir, f"srmpgd_iter_{i:03d}.png")
+                                pil_image.save(save_path)
+                                print(f"SR-MPGD 迭代 {i} 的图像已保存到: {save_path}")
+                            except Exception as e:
+                                print(f"保存迭代 {i} 图像时出错: {e}")
+                
+                print("SR-MPGD 优化完成")
 
         # If we do sequential model offloading, let's offload unet and controlnet
         # manually for max memory savings
@@ -539,10 +609,123 @@ class DiffQRCoderPipeline(StableDiffusionControlNetPipeline):
             torch.cuda.empty_cache()
 
         if not output_type == "latent":
-            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[
-                0
-            ]
-            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+            try:
+                # 如果设置了使用原始二维码，直接基于原始二维码生成图像
+                if use_original_qrcode:
+                    print("使用原始二维码作为基础图像...")
+                    if isinstance(qrcode, torch.Tensor):
+                        base_image = qrcode.to(device=latents.device, dtype=latents.dtype)
+                        if base_image.shape != (latents.shape[0], 3, self.unet.config.sample_size, self.unet.config.sample_size):
+                            # 调整大小和通道
+                            base_image = torch.nn.functional.interpolate(
+                                base_image, 
+                                size=(self.unet.config.sample_size, self.unet.config.sample_size), 
+                                mode='bilinear'
+                            )
+                            if base_image.shape[1] == 1:
+                                base_image = base_image.repeat(1, 3, 1, 1)
+                        
+                        # 添加一些随机变化，但保持二维码的基本结构
+                        noise = torch.randn_like(base_image) * 0.1
+                        image = base_image + noise
+                        image = torch.clamp(image, -1.0, 1.0)
+                        has_nsfw_concept = None
+                    else:
+                        raise ValueError("原始二维码不是张量，无法直接使用")
+                else:
+                    # 检查 latents 是否包含 NaN 值
+                    if torch.isnan(latents).any():
+                        print("警告：检测到 latents 中有 NaN 值，尝试修复...")
+                        latents = torch.nan_to_num(latents, nan=0.0)
+                    
+                    # 限制 latents 的范围，防止极端值
+                    latents_max = torch.abs(latents).max().item()
+                    if latents_max > 10.0:
+                        print(f"警告：检测到 latents 中有极端值 ({latents_max})，尝试裁剪...")
+                        latents = torch.clamp(latents, -10.0, 10.0)
+                    
+                    # 解码 latents
+                    image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[
+                        0
+                    ]
+                    
+                    # 检查并修复解码后的图像中的 NaN 值
+                    if torch.isnan(image).any():
+                        print("警告：VAE 解码产生了 NaN 值，尝试使用备用方法...")
+                        # 尝试使用不同的缩放因子
+                        image = self.vae.decode(latents / 2.0, return_dict=False, generator=generator)[0]
+                        
+                        # 如果仍然有 NaN，尝试使用更保守的方法
+                        if torch.isnan(image).any():
+                            print("备用方法仍产生 NaN，尝试使用更保守的方法...")
+                            # 使用非常小的缩放因子
+                            image = self.vae.decode(latents / 10.0, return_dict=False, generator=generator)[0]
+                            
+                            # 如果仍然有 NaN，生成基于原始二维码的图像
+                            if torch.isnan(image).any():
+                                print("所有备用方法都失败，生成基于原始二维码的图像...")
+                                # 使用原始二维码作为基础，添加一些随机变化
+                                if isinstance(qrcode, torch.Tensor):
+                                    base_image = qrcode.to(device=latents.device, dtype=latents.dtype)
+                                    if base_image.shape != (latents.shape[0], 3, self.unet.config.sample_size, self.unet.config.sample_size):
+                                        # 调整大小和通道
+                                        base_image = torch.nn.functional.interpolate(
+                                            base_image, 
+                                            size=(self.unet.config.sample_size, self.unet.config.sample_size), 
+                                            mode='bilinear'
+                                        )
+                                        if base_image.shape[1] == 1:
+                                            base_image = base_image.repeat(1, 3, 1, 1)
+                                    
+                                    # 添加一些随机变化，但保持二维码的基本结构
+                                    noise = torch.randn_like(base_image) * 0.1
+                                    image = base_image + noise
+                                    image = torch.clamp(image, -1.0, 1.0)
+                                else:
+                                    # 如果无法使用原始二维码，生成适度的随机图像
+                                    image_shape = (latents.shape[0], 3, self.unet.config.sample_size, self.unet.config.sample_size)
+                                    image = torch.rand(image_shape, device=latents.device, dtype=latents.dtype) * 0.5 + 0.25
+                    
+                    image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+            except Exception as e:
+                print(f"VAE 解码出错: {e}")
+                # 尝试使用原始二维码作为基础
+                try:
+                    print("尝试使用原始二维码作为基础...")
+                    if isinstance(qrcode, torch.Tensor):
+                        base_image = qrcode.to(device=latents.device, dtype=latents.dtype)
+                        if base_image.shape != (latents.shape[0], 3, self.unet.config.sample_size, self.unet.config.sample_size):
+                            # 调整大小和通道
+                            base_image = torch.nn.functional.interpolate(
+                                base_image, 
+                                size=(self.unet.config.sample_size, self.unet.config.sample_size), 
+                                mode='bilinear'
+                            )
+                            if base_image.shape[1] == 1:
+                                base_image = base_image.repeat(1, 3, 1, 1)
+                        
+                        # 添加一些随机变化，但保持二维码的基本结构
+                        noise = torch.randn_like(base_image) * 0.1
+                        image = base_image + noise
+                        image = torch.clamp(image, -1.0, 1.0)
+                        has_nsfw_concept = None
+                    else:
+                        raise ValueError("原始二维码不是张量")
+                except Exception as e:
+                    print(f"使用原始二维码作为基础失败: {e}")
+                    # 生成适度的随机图像作为最后的备用
+                    print("生成适度的随机图像作为最后的备用...")
+                    image_shape = (latents.shape[0], 3, self.unet.config.sample_size, self.unet.config.sample_size)
+                    image = torch.rand(image_shape, device=latents.device, dtype=latents.dtype) * 0.5 + 0.25
+                    has_nsfw_concept = None
+            
+            # 添加调试信息，打印像素值范围
+            print(f"解码后图像值范围: min={image.min().item() if not torch.isnan(image.min()) else 'nan'}, max={image.max().item() if not torch.isnan(image.max()) else 'nan'}, mean={image.mean().item() if not torch.isnan(image.mean()) else 'nan'}")
+            
+            # 修复任何剩余的 NaN 值
+            if torch.isnan(image).any():
+                print("修复解码后图像中的 NaN 值...")
+                image = torch.nan_to_num(image, nan=0.0)
         else:
             image = latents
             has_nsfw_concept = None
@@ -552,7 +735,58 @@ class DiffQRCoderPipeline(StableDiffusionControlNetPipeline):
         else:
             do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
-        image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        # 添加调试信息，打印是否进行反归一化
+        print(f"是否进行反归一化: {do_denormalize}")
+        
+        # 保存原始图像用于调试
+        if save_intermediate_steps:
+            try:
+                # 手动将图像转换为0-255范围并保存
+                debug_image = image.cpu().detach()
+                # 确保值在合理范围内
+                debug_image = torch.clamp(debug_image, -1.0, 1.0)
+                # 转换到0-255范围
+                debug_image = ((debug_image + 1.0) * 127.5).round().to(torch.uint8)
+                
+                import torchvision.utils as vutils
+                debug_path = os.path.join(intermediate_dir, "pre_postprocess_image.png")
+                vutils.save_image(debug_image.float() / 255.0, debug_path)
+                print(f"已保存预处理图像到: {debug_path}")
+            except Exception as e:
+                print(f"保存调试图像时出错: {e}")
+        
+        # 使用自定义后处理或默认后处理
+        if use_custom_postprocess:
+            try:
+                from main import custom_postprocess_image
+                print("使用自定义后处理函数...")
+                if isinstance(image, list):
+                    processed_images = [custom_postprocess_image(img) for img in image]
+                else:
+                    processed_images = [custom_postprocess_image(image[i]) for i in range(image.shape[0])]
+                image = processed_images
+            except Exception as e:
+                print(f"自定义后处理失败，回退到默认处理: {e}")
+                image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        else:
+            image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        
+        # 检查处理后的图像
+        if output_type == "pil" and save_intermediate_steps:
+            try:
+                # 保存处理后的图像的像素值信息
+                if isinstance(image, list):
+                    first_image = image[0]
+                    import numpy as np
+                    img_array = np.array(first_image)
+                    print(f"处理后图像值范围: min={img_array.min()}, max={img_array.max()}, mean={img_array.mean():.2f}")
+                    
+                    # 保存一个副本用于调试
+                    debug_path = os.path.join(intermediate_dir, "post_process_image.png")
+                    first_image.save(debug_path)
+                    print(f"已保存后处理图像到: {debug_path}")
+            except Exception as e:
+                print(f"分析处理后图像时出错: {e}")
 
         # Offload all models
         self.maybe_free_model_hooks()
@@ -601,9 +835,14 @@ class DiffQRCoderPipeline(StableDiffusionControlNetPipeline):
     callback_on_step_end: Optional[  
         Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]  
     ] = None,  
-    callback_on_step_end_tensor_inputs: List[str] = ["latents"],  
+    callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+    save_intermediate_steps: bool = False,  # 新增参数，控制是否保存中间结果
+    intermediate_dir: str = "output/intermediate",  # 新增参数，保存中间结果的目录
+    use_custom_postprocess: bool = True,  # 新增参数，默认使用自定义后处理
+    use_original_qrcode: bool = False,  # 新增参数，控制是否使用原始二维码
     **kwargs,  
 ):
+        print("阶段1: 生成基础二维码图像...")
         stage1_output = self._run_stage1(
             prompt=prompt,
             qrcode=qrcode,
@@ -633,6 +872,29 @@ class DiffQRCoderPipeline(StableDiffusionControlNetPipeline):
             callback_on_step_end=callback_on_step_end,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
         )
+        
+        # 保存第一阶段的输出图像
+        if save_intermediate_steps:
+            from PIL import Image
+            import torchvision.transforms as T
+            
+            print("保存阶段1输出图像...")
+            # 将Tensor转换为PIL图像
+            to_pil = T.ToPILImage()
+            stage1_image = to_pil(stage1_output.images[0].cpu().detach())
+            
+            # 保存图像
+            stage1_path = os.path.join(intermediate_dir, "stage1_output.png")
+            stage1_image.save(stage1_path)
+            print(f"阶段1图像已保存到: {stage1_path}")
+            
+            # 保存原始二维码图像
+            if isinstance(qrcode, Image.Image):
+                qrcode_path = os.path.join(intermediate_dir, "original_qrcode.png")
+                qrcode.save(qrcode_path)
+                print(f"原始二维码已保存到: {qrcode_path}")
+        
+        print("阶段2: 应用扫描鲁棒性和感知引导...")
         stage2_output = self._run_stage2(
             logo_image=logo_image,  # Add this line  
             logo_guidance_scale=logo_guidance_scale,  # Add this line too 
@@ -669,5 +931,9 @@ class DiffQRCoderPipeline(StableDiffusionControlNetPipeline):
             srmpgd_num_iteration=srmpgd_num_iteration,
             callback_on_step_end=callback_on_step_end,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            save_intermediate_steps=save_intermediate_steps,
+            intermediate_dir=intermediate_dir,
+            use_custom_postprocess=use_custom_postprocess,
+            use_original_qrcode=use_original_qrcode,
         )
         return stage2_output

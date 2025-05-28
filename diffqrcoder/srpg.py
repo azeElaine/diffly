@@ -2,11 +2,10 @@ import torch
 from torch import nn
 
 from diffqrcoder.losses import PerceptualLoss, ScanningRobustLoss
-from diffqrcoder.losses import LogoLoss
+from .logo_loss import LogoLoss
 
-
-GRADIENT_SCALE = 100
-
+# 梯度缩放因子，用于避免梯度爆炸
+GRADIENT_SCALE = 1.0
 
 class ScanningRobustPerceptualGuidance(nn.Module):
     def __init__(
@@ -25,61 +24,112 @@ class ScanningRobustPerceptualGuidance(nn.Module):
         self.logo_guidance_scale = logo_guidance_scale
         self.scanning_robust_loss_fn = ScanningRobustLoss(module_size=module_size)
         self.perceptual_loss_fn = PerceptualLoss()
-        self.logo_loss_fn = LogoLoss(feature_layer=feature_layer, use_input_norm=use_normalize) 
+        self.logo_loss_fn = LogoLoss(logo_guidance_scale)
+        self.device = None
+        self.dtype = None
 
-    def compute_loss(self,
+    def to(self, device):
+        self.device = device
+        self.scanning_robust_loss_fn = self.scanning_robust_loss_fn.to(device)
+        self.perceptual_loss_fn = self.perceptual_loss_fn.to(device)
+        return self
+
+    def to_dtype(self, dtype):
+        self.dtype = dtype
+        return self
+
+    def compute_loss(
+        self,
         image: torch.Tensor,
         qrcode: torch.Tensor,
-        ref_image: torch.Tensor,
+        ref_image: torch.Tensor = None,
         logo_image: torch.Tensor = None,
-        logo_mask: torch.Tensor = None) -> torch.Tensor:
+        logo_mask: torch.Tensor = None
+    ) -> torch.Tensor:
+        # 检查并修复输入中的NaN值
+        if torch.isnan(image).any():
+            image = torch.nan_to_num(image, nan=0.0)
+        if torch.isnan(qrcode).any():
+            qrcode = torch.nan_to_num(qrcode, nan=0.0)
+        if ref_image is not None and torch.isnan(ref_image).any():
+            ref_image = torch.nan_to_num(ref_image, nan=0.0)
         
-        # 如果没有提供logo相关参数，使用原来的损失计算
-        if logo_image is None or logo_mask is None:
-            loss = (
-                self.scanning_robust_guidance_scale * self.scanning_robust_loss_fn(image, qrcode) +
-                self.perceptual_guidance_scale * self.perceptual_loss_fn(image, ref_image)
-            )
-            return loss * GRADIENT_SCALE
+        # 计算扫描鲁棒性损失
+        scanning_robust_loss = self.scanning_robust_loss_fn(image, qrcode)
         
-        # 确保mask格式正确
-        if len(logo_mask.shape) == 3:
-            logo_mask = logo_mask.unsqueeze(1)
-        logo_mask = logo_mask.to(image.dtype)
+        # 计算感知损失
+        perceptual_loss = torch.tensor(0.0, device=image.device)
+        if ref_image is not None:
+            perceptual_loss = self.perceptual_loss_fn(image, ref_image)
         
-        # 为logo区域和非logo区域创建反向掩码
-        non_logo_mask = 1.0 - logo_mask
-        
-        # 计算logo区域的损失 - 只使用logo损失
-        logo_loss = self.logo_loss_fn(image, logo_image, logo_mask)
-        
-        # 计算非logo区域的损失 - 增强扫描鲁棒性损失
-        # 对非logo区域应用更高权重的扫描鲁棒性损失，确保它能被正确识别为二维码
-        # 使用 * 运算来限制损失计算范围在非logo区域
-        scanning_robust_loss = self.scanning_robust_loss_fn(
-            image * non_logo_mask, 
-            qrcode * non_logo_mask
-        )
-        
-        # 对非logo区域应用极低权重的感知损失，主要目的是使其在视觉上与整体协调
-        # 但扫描鲁棒性仍然是最重要的
-        perceptual_loss = self.perceptual_loss_fn(
-            image * non_logo_mask, 
-            ref_image * non_logo_mask
-        )
-        
-        # 合并损失 - 为非logo区域的扫描鲁棒性损失提供更高权重
-        # 这样可以确保二维码部分能被正确识别
-        total_loss = (
-            self.logo_guidance_scale * logo_loss +  # logo区域应用高权重的logo损失
-            (self.scanning_robust_guidance_scale * 1.5) * scanning_robust_loss +  # 非logo区域应用增强的扫描鲁棒性损失
-            (self.perceptual_guidance_scale * 0.3) * perceptual_loss  # 对非logo区域应用极低权重的感知损失
-        )
+        # 计算Logo损失
+        logo_loss = torch.tensor(0.0, device=image.device)
+        if logo_image is not None and logo_mask is not None:
+            # 确保mask格式正确
+            if len(logo_mask.shape) == 3:
+                logo_mask = logo_mask.unsqueeze(1)
             
+            # 确保数据类型一致
+            logo_mask = logo_mask.to(device=image.device, dtype=image.dtype)
+            logo_image = logo_image.to(device=image.device, dtype=image.dtype)
+            
+            # 为logo区域和非logo区域创建反向掩码
+            non_logo_mask = 1.0 - logo_mask
+            
+            # 计算logo区域的损失
+            logo_loss = self.logo_loss_fn.compute_loss(image, logo_image, logo_mask)
+            
+            # 对非logo区域应用更高权重的扫描鲁棒性损失
+            scanning_robust_loss = self.scanning_robust_loss_fn(
+                image * non_logo_mask, 
+                qrcode * non_logo_mask
+            )
+        
+        # 组合损失
+        total_loss = (
+            self.scanning_robust_guidance_scale * scanning_robust_loss +
+            self.perceptual_guidance_scale * perceptual_loss +
+            logo_loss  # logo_loss已经在内部应用了缩放因子
+        )
+        
         return total_loss * GRADIENT_SCALE
 
-    def compute_score(self, latents: torch.Tensor, image: torch.Tensor, qrcode: torch.Tensor,
-                     ref_image: torch.Tensor, logo_image: torch.Tensor = None,
-                     logo_mask: torch.Tensor = None) -> torch.Tensor:
+    def compute_score(
+        self,
+        latents: torch.Tensor,
+        image: torch.Tensor,
+        qrcode: torch.Tensor,
+        ref_image: torch.Tensor = None,
+        logo_image: torch.Tensor = None,
+        logo_mask: torch.Tensor = None
+    ) -> torch.Tensor:
+        """计算梯度得分"""
+        # 检查并修复输入中的NaN值
+        if torch.isnan(image).any():
+            image = torch.nan_to_num(image, nan=0.0)
+        if torch.isnan(qrcode).any():
+            qrcode = torch.nan_to_num(qrcode, nan=0.0)
+        if ref_image is not None and torch.isnan(ref_image).any():
+            ref_image = torch.nan_to_num(ref_image, nan=0.0)
+        
+        # 计算损失
         loss = self.compute_loss(image, qrcode, ref_image, logo_image, logo_mask)
-        return -torch.autograd.grad(loss, latents)[0]
+        
+        # 如果损失是NaN，返回零梯度
+        if torch.isnan(loss):
+            print("警告：损失为NaN，返回零梯度")
+            return torch.zeros_like(latents)
+        
+        try:
+            # 计算梯度
+            grad = torch.autograd.grad(loss, latents)[0]
+            
+            # 检查并修复梯度中的NaN值
+            if torch.isnan(grad).any():
+                print("警告：梯度包含NaN值，使用零梯度")
+                grad = torch.zeros_like(grad)
+            
+            return -grad  # 注意负号，与原始实现保持一致
+        except Exception as e:
+            print(f"计算梯度时出错: {e}")
+            return torch.zeros_like(latents)

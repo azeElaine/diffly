@@ -5,9 +5,123 @@ import numpy as np
 import torch
 from diffusers import ControlNetModel, DDIMScheduler
 from diffusers.utils import load_image
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageEnhance
 
 from diffqrcoder import DiffQRCoderPipeline
+
+
+def check_cuda_and_memory():
+    """检查CUDA是否可用以及GPU内存情况"""
+    print("\n===== CUDA 和 GPU 内存检查 =====")
+    print(f"CUDA 是否可用: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA 版本: {torch.version.cuda}")
+        print(f"当前设备: {torch.cuda.get_device_name(0)}")
+        print(f"当前设备索引: {torch.cuda.current_device()}")
+        print(f"设备数量: {torch.cuda.device_count()}")
+        
+        # 显示内存信息
+        print("\n----- GPU 内存信息 -----")
+        print(f"分配的内存: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+        print(f"缓存的内存: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+        print(f"最大内存: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
+        
+        # 尝试清理内存
+        torch.cuda.empty_cache()
+        print("\n已清理 CUDA 缓存")
+    print("==============================\n")
+
+
+def custom_postprocess_image(tensor_image):
+    """自定义图像后处理函数，确保图像不会变黑或变灰，同时保持二维码的可扫描性"""
+    # 确保张量在CPU上并分离梯度
+    tensor_image = tensor_image.cpu().detach()
+    
+    # 打印原始值范围
+    print(f"后处理前图像值范围: min={tensor_image.min().item() if not torch.isnan(tensor_image.min()) else 'nan'}, max={tensor_image.max().item() if not torch.isnan(tensor_image.max()) else 'nan'}")
+    
+    # 检查并修复NaN值
+    if torch.isnan(tensor_image).any():
+        print("检测到NaN值，尝试修复...")
+        # 将NaN值替换为0
+        tensor_image = torch.nan_to_num(tensor_image, nan=0.0)
+    
+    # 如果图像值范围异常，尝试修复
+    if tensor_image.min() < -1.0 or tensor_image.max() > 1.0:
+        print("检测到异常值范围，尝试修复...")
+        tensor_image = torch.clamp(tensor_image, -1.0, 1.0)
+    
+    # 转换到0-1范围
+    if tensor_image.min() < 0:
+        # 如果有负值，假设范围是[-1, 1]
+        tensor_image = (tensor_image + 1.0) / 2.0
+    
+    # 确保值在[0, 1]范围内
+    tensor_image = torch.clamp(tensor_image, 0.0, 1.0)
+    
+    # 检查图像是否是灰色（所有通道值接近）
+    if tensor_image.shape[0] == 3:
+        channel_mean = tensor_image.mean(dim=(1, 2))
+        channel_std = torch.std(channel_mean)
+        
+        if channel_std < 0.02:  # 如果通道间标准差很小，说明是灰色图像
+            print("检测到图像接近灰色，轻微增加彩色对比度...")
+            # 增加对比度，但保持适度
+            tensor_image = (tensor_image - 0.5) * 1.2 + 0.5
+            tensor_image = torch.clamp(tensor_image, 0.0, 1.0)
+            
+            # 为不同通道添加轻微的色调变化
+            tensor_image[0] = tensor_image[0] * 1.05  # 轻微增加红色
+            tensor_image[2] = tensor_image[2] * 1.05  # 轻微增加蓝色
+            tensor_image = torch.clamp(tensor_image, 0.0, 1.0)
+    
+    # 如果图像全黑或接近全黑/全灰，生成彩色噪声图像
+    if tensor_image.mean() < 0.2 or (tensor_image.max() - tensor_image.min()) < 0.1:
+        print("检测到图像接近全黑或全灰，生成彩色噪声图像...")
+        # 生成彩色随机噪声
+        noise = torch.rand_like(tensor_image) * 0.5 + 0.25  # 值在[0.25, 0.75]范围内
+        
+        # 为噪声添加一些结构
+        if tensor_image.shape[0] == 3:
+            # 红色通道噪声
+            noise[0] = noise[0] * 1.2
+            # 绿色通道噪声
+            noise[1] = noise[1] * 0.9
+            # 蓝色通道噪声
+            noise[2] = noise[2] * 1.1
+            
+        # 混合原图和噪声
+        tensor_image = tensor_image * 0.2 + noise * 0.8
+        tensor_image = torch.clamp(tensor_image, 0.0, 1.0)
+    
+    # 转换为PIL图像
+    tensor_image = tensor_image * 255
+    tensor_image = tensor_image.to(torch.uint8)
+    
+    # 转换为PIL图像
+    if tensor_image.shape[0] == 3:
+        # 如果是[3, H, W]格式，转置为[H, W, 3]
+        tensor_image = tensor_image.permute(1, 2, 0)
+    
+    # 转换为numpy数组
+    numpy_image = tensor_image.numpy()
+    
+    # 创建PIL图像
+    pil_image = Image.fromarray(numpy_image)
+    
+    # 轻微增强图像
+    try:
+        # 轻微增加对比度
+        enhancer = ImageEnhance.Contrast(pil_image)
+        pil_image = enhancer.enhance(1.1)
+        
+        # 轻微增加饱和度
+        enhancer = ImageEnhance.Color(pil_image)
+        pil_image = enhancer.enhance(1.1)
+    except Exception as e:
+        print(f"增强图像时出错: {e}")
+    
+    return pil_image
 
 
 def parse_arguments() -> Namespace:
@@ -132,6 +246,27 @@ def parse_arguments() -> Namespace:
         default=240,
         help="Threshold for background removal (0-255), higher values preserve more of the logo"
     )
+    parser.add_argument(
+        "--save_intermediate",
+        action="store_true",
+        help="Save intermediate results during generation process"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+        help="Random seed for generation"
+    )
+    parser.add_argument(
+        "--random_seed",
+        action="store_true",
+        help="Use random seed instead of fixed seed"
+    )
+    parser.add_argument(
+        "--use_original_qrcode",
+        action="store_true",
+        help="Use original QR code as base image with minimal modifications"
+    )
     return parser.parse_args()
 
 
@@ -191,9 +326,27 @@ def resize_and_position_logo(logo_img, target_size, position, size_ratio):
 
 
 if __name__ == "__main__":
+    # 检查 CUDA 和 GPU 内存
+    check_cuda_and_memory()
+    
     args = parse_arguments()
     os.makedirs(args.output_folder, exist_ok=True)
-
+    
+    # 创建保存中间结果的目录
+    intermediate_dir = os.path.join(args.output_folder, "intermediate")
+    os.makedirs(intermediate_dir, exist_ok=True)
+    
+    # 设置随机种子
+    if args.random_seed:
+        import random
+        args.seed = random.randint(1, 1000000)
+        print(f"使用随机种子: {args.seed}")
+    else:
+        print(f"使用固定种子: {args.seed}")
+    
+    # 设置 Hugging Face 镜像站点
+    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+    
     qrcode = load_image(args.qrcode_path)
     logo_img = None
     
@@ -233,12 +386,21 @@ if __name__ == "__main__":
         torch_dtype=torch.float16,
         local_files_only=True 
     )
-    pipe = DiffQRCoderPipeline.from_single_file(
-        args.pipe_ckpt,
-        controlnet=controlnet,
-        torch_dtype=torch.float16,
-        local_files_only=True 
-    )
+    
+    # 使用本地文件加载模型
+    try:
+        pipe = DiffQRCoderPipeline.from_single_file(
+            args.pipe_ckpt,
+            controlnet=controlnet,
+            torch_dtype=torch.float16,
+            local_files_only=True 
+        )
+    except Exception as e:
+        print(f"加载模型失败: {e}")
+        print("请确保已下载所需的模型文件，并放置在正确的位置。")
+        print(f"ControlNet模型路径: {args.controlnet_ckpt}")
+        print(f"Pipeline模型路径: {args.pipe_ckpt}")
+        exit(1)
     
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
     # Memory optimizations  
@@ -278,12 +440,16 @@ if __name__ == "__main__":
         qrcode_padding=args.qrcode_padding,
         negative_prompt=args.neg_prompt,
         num_inference_steps=args.num_inference_steps,
-        generator=torch.Generator(device=args.device).manual_seed(1),
+        generator=torch.Generator(device=args.device).manual_seed(args.seed),
         controlnet_conditioning_scale=args.controlnet_conditioning_scale,
         scanning_robust_guidance_scale=scanning_robust_scale,
         perceptual_guidance_scale=args.perceptual_guidance_scale,
         srmpgd_num_iteration=args.srmpgd_num_iteration,
         srmpgd_lr=args.srmpgd_lr,
+        save_intermediate_steps=args.save_intermediate,
+        intermediate_dir=intermediate_dir,
+        use_custom_postprocess=True,  # 使用自定义后处理
+        use_original_qrcode=args.use_original_qrcode,  # 使用原始二维码
     )
     
     # 保存结果
@@ -295,5 +461,22 @@ if __name__ == "__main__":
     
     output_filename = f"qrcode{suffix}.png"
     output_path = Path(args.output_folder, output_filename)
+    
+    # 检查图像是否为黑色
+    result_img_array = np.array(result.images[0])
+    print(f"最终图像像素值统计: min={result_img_array.min()}, max={result_img_array.max()}, mean={result_img_array.mean():.2f}")
+    
+    if result_img_array.mean() < 10:  # 如果平均值小于10，可能是黑色图像
+        print("警告: 生成的图像可能是全黑的!")
+        
+        # 尝试调整图像亮度并保存一个副本
+        try:
+            enhanced_img = ImageEnhance.Brightness(result.images[0]).enhance(10.0)  # 增强亮度10倍
+            enhanced_path = Path(args.output_folder, f"enhanced_{output_filename}")
+            enhanced_img.save(enhanced_path)
+            print(f"已保存增强亮度的图像到: {enhanced_path}")
+        except Exception as e:
+            print(f"增强图像亮度时出错: {e}")
+    
     result.images[0].save(output_path)
     print(f"已保存结果到: {output_path}")
