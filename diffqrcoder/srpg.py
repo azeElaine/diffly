@@ -2,7 +2,7 @@ import torch
 from torch import nn
 
 from diffqrcoder.losses import PerceptualLoss, ScanningRobustLoss
-from .logo_loss import LogoLoss
+from diffqrcoder.logo_loss import LogoLoss
 
 # 梯度缩放因子，用于避免梯度爆炸
 GRADIENT_SCALE = 1.0
@@ -24,7 +24,7 @@ class ScanningRobustPerceptualGuidance(nn.Module):
         self.logo_guidance_scale = logo_guidance_scale
         self.scanning_robust_loss_fn = ScanningRobustLoss(module_size=module_size)
         self.perceptual_loss_fn = PerceptualLoss()
-        self.logo_loss_fn = LogoLoss(logo_guidance_scale)
+        self.logo_loss_fn = LogoLoss(logo_guidance_scale=logo_guidance_scale)
         self.device = None
         self.dtype = None
 
